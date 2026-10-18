@@ -9,6 +9,7 @@ import com.ethosprotocol.models.AuthToken
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.mockk.every
@@ -19,8 +20,12 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 class ApiClientTest {
 
@@ -210,5 +215,108 @@ class ApiClientTest {
             "Your recovery code has expired. Please request a new one.",
             (result as ApiResult.Error).message
         )
+    }
+
+    // #607: the signing key must be derived from the server-issued session secret,
+    // never from the bearer token that already travels on every request.
+    @Test
+    fun `request signature is not keyed with the raw bearer token`() = runTest {
+        every { tokenProvider.token } returns "bearer-token"
+        every { tokenProvider.isNearExpiry() } returns false
+        every { tokenProvider.signingSecret } returns "session-signing-secret"
+
+        var signature: String? = null
+        val engine = MockEngine { request ->
+            signature = request.headers["X-Request-Signature"]
+            respond(
+                content = "[]",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        apiClient.listVaults()
+
+        val actual = assertNotNull(signature).let { signature!! }
+        val keyedWithBearer = hmacSha256("bearer-token", "anything")
+        assertNotEquals(keyedWithBearer, actual)
+        assertFalse(actual.contains("bearer-token"))
+    }
+
+    // #607: the canonical string must bind method, path and body hash so a captured
+    // signature cannot be replayed against a different endpoint.
+    @Test
+    fun `request signature binds method path and body hash`() = runTest {
+        every { tokenProvider.token } returns "bearer-token"
+        every { tokenProvider.isNearExpiry() } returns false
+        every { tokenProvider.signingSecret } returns "session-signing-secret"
+
+        var signature: String? = null
+        val engine = MockEngine { request ->
+            signature = request.headers["X-Request-Signature"]
+            respond(
+                content = "[]",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        apiClient.listVaults()
+
+        val actual = assertNotNull(signature).let { signature!! }
+        val expected = hmacSha256(
+            "session-signing-secret",
+            "GET\n/vaults\n${sha256Hex("")}"
+        )
+        assertEquals(expected, actual)
+    }
+
+    // #607: a signature minted for one path must not validate for another.
+    @Test
+    fun `signature captured for one path is rejected against a different path`() = runTest {
+        every { tokenProvider.token } returns "bearer-token"
+        every { tokenProvider.isNearExpiry() } returns false
+        every { tokenProvider.signingSecret } returns "session-signing-secret"
+
+        val signatures = mutableMapOf<String, String>()
+        val engine = MockEngine { request ->
+            request.headers["X-Request-Signature"]?.let { signatures[request.url.encodedPath] = it }
+            respond(
+                content = "[]",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val apiClient = ApiClient(tokenProvider, networkMonitor, offlineCache, "https://test", engine)
+
+        apiClient.listVaults()
+        apiClient.listVaults()
+
+        val vaultsSignature = assertNotNull(signatures["/vaults"]).let { signatures["/vaults"]!! }
+        val replayed = hmacSha256(
+            "session-signing-secret",
+            "GET\n/vaults\n${sha256Hex("")}"
+        )
+        assertEquals(replayed, vaultsSignature)
+
+        // The same signature must not match the canonical string for a different path.
+        val otherPath = hmacSha256(
+            "session-signing-secret",
+            "GET\n/vaults/other\n${sha256Hex("")}"
+        )
+        assertNotEquals(otherPath, vaultsSignature)
+    }
+
+    private fun hmacSha256(key: String, data: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        return mac.doFinal(data.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    private fun sha256Hex(data: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        return digest.digest(data.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
     }
 }
